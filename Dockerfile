@@ -1,6 +1,5 @@
 FROM golang:1.13 as builder
 
-ENV GO111MODULE=on
 WORKDIR /go/src/ambassador-auth-oidc
 # Download all dependencies
 COPY go.mod .
@@ -8,7 +7,7 @@ COPY go.sum .
 RUN go mod download
 # Copy in the code and compile
 COPY *.go /go/src/ambassador-auth-oidc/
-RUN go build -a -o /go/bin/ambassador-auth-oidc
+RUN CGO_ENABLED=0 go build -a -o /go/bin/ambassador-auth-oidc
 
 FROM alpine:3.10
 LABEL org.label-schema.vcs-url="https://github.com/ajmyyra/ambassador-auth-oidc"
