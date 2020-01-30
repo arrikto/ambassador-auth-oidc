@@ -22,6 +22,8 @@ var redisdb *redis.Client
 
 var logoutCookie = false
 var disableUserInfo = false
+var userIDHeader string
+var userIDPrefix string
 
 var whitelist []string
 var blacklist []string // TODO Refactor to struct with expiration time, and add cleaner.
@@ -68,6 +70,11 @@ func init() {
 	if envContent == "true" {
 		disableUserInfo = true
 	}
+
+	userIDHeader = getenvOrDefault("USERID_HEADER", "x-goog-authenticated-user-email")
+	userIDPrefix = getenvOrDefault("USERID_PREFIX", "accounts.google.com:")
+	log.Printf("Using UserID Header: %s", userIDHeader)
+	log.Printf("Using UserID Prefix: %s", userIDPrefix)
 }
 
 // LoginHandler processes login requests
@@ -132,7 +139,6 @@ func AuthReqHandler(w http.ResponseWriter, r *http.Request) {
 
 		http.SetCookie(w, deletionCookie)
 		beginOIDCLogin(w, r, r.URL.Path)
-		returnStatus(w, http.StatusUnauthorized, "Cookie/header expired or malformed.")
 		return
 	}
 
@@ -143,6 +149,8 @@ func AuthReqHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// log.Println("token: ", token)
+
 	uifClaim, err := base64decode(token.Claims.(jwt.MapClaims)["uif"].(string))
 	if err != nil {
 		log.Println(getUserIP(r), r.URL.String(), "Not able to decode base64 content:", err.Error())
@@ -151,8 +159,35 @@ func AuthReqHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Here we retrive groups info.
+	// the userinfo sent from keycloak can be figured configured in Client/Mapper/...
+
+	userInfo := struct {
+		Groups []string `json:"groups"`
+	}{}
+	if err := json.Unmarshal(uifClaim, &userInfo); err != nil {
+		log.Println("Error unmarshaling claims: %v", err)
+		returnStatus(w, http.StatusInternalServerError, "error unmarshaling user claims")
+	}
+	userGroups := strings.Join(userInfo.Groups, ", ")
+
 	log.Println(getUserIP(r), r.URL.String(), "Authorized & accepted.")
-	w.Header().Set("X-Auth-Userinfo", string(uifClaim[:]))
+
+	log.Printf("Adding header: %s = %s", "groups", userGroups)
+	w.Header().Set("groups", userGroups)
+
+	// We add Access Token in the Authorization here for the istio to do the authorization with
+	// the "request.auth.claims[groups]: admin" in the ServiceRoleBinding
+	// since a user can have multiple groups, while header value can only be the string
+	// so the header can be "[phuser, everyone, admin]"  as a string rather than a list.
+	// istio doesn't have "match" sementic in "subjects.properties.request.header"
+	// we have to depend on "match" sementic in "request.auth.claims[groups]: admin"
+	// so that's why we still have to add Authorization here.
+	log.Printf("Adding header: %s", "Authorization")
+	bearer := "Bearer " + token.Claims.(jwt.MapClaims)["accesstoken"].(string)
+	w.Header().Set("Authorization", bearer)
+
+	log.Println("request w: ", w)
 	returnStatus(w, http.StatusOK, "OK")
 }
 

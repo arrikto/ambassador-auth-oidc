@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"net/http"
@@ -36,9 +39,49 @@ func init() {
 
 	ctx = context.Background()
 
-	provider, err := oidc.NewProvider(ctx, parseEnvURL("OIDC_PROVIDER").String())
-	if err != nil {
-		log.Fatal("OIDC provider setup failed: ", err)
+	oidcProviderCAFile := os.Getenv("OIDC_PROVIDER_CA_FILE")
+	if oidcProviderCAFile != "" {
+
+		log.Printf("Adding custom CA from %s", oidcProviderCAFile)
+		// Get the SystemCertPool, continue with an empty pool on error
+		rootCAs, err := x509.SystemCertPool()
+		if err != nil {
+			log.Printf("Error trying to get system certs: %v", err)
+			rootCAs = x509.NewCertPool()
+		}
+
+		// Read in the cert file
+		certs, err := ioutil.ReadFile(oidcProviderCAFile)
+		if err != nil {
+			log.Fatalf("Failed to append %q to RootCAs: %v", oidcProviderCAFile, err)
+		}
+
+		// Append our cert to the system pool
+		if ok := rootCAs.AppendCertsFromPEM(certs); !ok {
+			log.Println("No certs appended, using system certs only")
+		}
+
+		client := &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					RootCAs: rootCAs,
+				},
+			},
+		}
+
+		ctx = oidc.ClientContext(ctx, client)
+	}
+
+	var provider *oidc.Provider
+	var err error
+	for {
+		provider, err = oidc.NewProvider(ctx, parseEnvURL("OIDC_PROVIDER").String())
+		if err == nil {
+			break
+		}
+		log.Printf("OIDC provider setup failed: ", err)
+		log.Println("Retrying in 10 seconds...")
+		time.Sleep(10 * time.Second)
 	}
 
 	oidcConfig = &oidc.Config{
@@ -87,6 +130,7 @@ type loginSession struct {
 // OIDCHandler processes authn responses from OpenID Provider, exchanges token to userinfo and establishes user session with cookie containing JWT token
 func OIDCHandler(w http.ResponseWriter, r *http.Request) {
 	var authCode = r.FormValue("code")
+	log.Println("get authCode: ", authCode)
 	if len(authCode) == 0 {
 		log.Println(getUserIP(r), "Missing url parameter: code")
 		returnStatus(w, http.StatusBadRequest, "Missing url parameter: code")
@@ -94,6 +138,7 @@ func OIDCHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var state = r.FormValue("state")
+	log.Println("get state: ", state)
 	if len(state) == 0 {
 		log.Println(getUserIP(r), "Missing url parameter: state")
 		returnStatus(w, http.StatusBadRequest, "Missing url parameter: state")
@@ -117,6 +162,7 @@ func OIDCHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		session, err := findLocalLoginSession(state)
+		log.Println("session: ", session)
 		if err != nil {
 			log.Print(getUserIP(r), " No state found with ", state, ", starting new auth session.\n")
 			beginOIDCLogin(w, r, "/")
@@ -124,9 +170,11 @@ func OIDCHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		destination = session.OrigURL
+		log.Println("destination: ", destination)
 	}
 
 	oauth2Token, err := oauth2Config.Exchange(ctx, authCode)
+	log.Println("oauth2Token: ", oauth2Token)
 	if err != nil {
 		log.Println("Failed to exchange token:", err.Error())
 		returnStatus(w, http.StatusInternalServerError, "Failed to exchange token.")
@@ -134,6 +182,7 @@ func OIDCHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rawIDToken, ok := oauth2Token.Extra("id_token").(string)
+	log.Println("rawIDToken: ", rawIDToken)
 	if !ok {
 		log.Println("No id_token field available.")
 		returnStatus(w, http.StatusInternalServerError, "No id_token field in OAuth 2.0 token.")
@@ -143,6 +192,7 @@ func OIDCHandler(w http.ResponseWriter, r *http.Request) {
 	// Verifying received ID token
 	verifier := oidcProvider.Verifier(oidcConfig)
 	idToken, err := verifier.Verify(ctx, rawIDToken)
+	log.Println("idToken: ", idToken)
 	if err != nil {
 		log.Println("Not able to verify ID token:", err.Error())
 		returnStatus(w, http.StatusInternalServerError, "Unable to verify ID token.")
@@ -151,13 +201,17 @@ func OIDCHandler(w http.ResponseWriter, r *http.Request) {
 
 	claims := json.RawMessage{}
 	if disableUserInfo {
+		log.Println("in disableUserInfo")
 		if err = idToken.Claims(&claims); err != nil {
 			log.Println("Problem getting id_token claims:", err.Error())
 			returnStatus(w, http.StatusInternalServerError, "Not able to fetch id_token claims.")
 			return
 		}
 	} else {
+		log.Println("Not in disableUserInfo")
 		userInfo, err := oidcProvider.UserInfo(ctx, oauth2.StaticTokenSource(oauth2Token))
+		log.Println(userInfo)
+
 		if err != nil {
 			log.Println("Problem fetching userinfo:", err.Error())
 			returnStatus(w, http.StatusInternalServerError, "Not able to fetch userinfo.")
@@ -171,8 +225,11 @@ func OIDCHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	userJwt := createSignedJWT(claims, idToken.Expiry)
+	userJwt := createSignedJWT(claims, idToken.Expiry, oauth2Token)
 	cookie := createCookie(userJwt, idToken.Expiry, hostname)
+	log.Println("claims: ", claims)
+	log.Println("userJwt: ", userJwt)
+	log.Println("cookie: ", cookie)
 
 	// Removing OIDC flow state from DB
 	if redisdb != nil {
@@ -181,6 +238,7 @@ func OIDCHandler(w http.ResponseWriter, r *http.Request) {
 			log.Println("WARNING: Unable to remove state from DB,", err.Error())
 		}
 	} else {
+		log.Println("before removeLoginSession")
 		removeLoginSession(state)
 	}
 
@@ -219,13 +277,14 @@ func createCookie(sessionJwt string, expiration time.Time, domain string) *http.
 	return cookie
 }
 
-func createSignedJWT(userinfo []byte, expiration time.Time) string {
+func createSignedJWT(userinfo []byte, expiration time.Time, oauth2Token *oauth2.Token) string {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS512, jwt.MapClaims{
-		"jti": uuid.New().String(),
-		"iss": hostname,
-		"iat": time.Now().Unix(),
-		"exp": expiration.Unix(),
-		"uif": base64encode(userinfo), // Userinfo will be readable to user
+		"jti":         uuid.New().String(),
+		"iss":         hostname,
+		"iat":         time.Now().Unix(),
+		"exp":         expiration.Unix(),
+		"uif":         base64encode(userinfo), // Userinfo will be readable to user
+		"accesstoken": oauth2Token.AccessToken,
 	})
 
 	tokenString, err := token.SignedString(hmacSecret)

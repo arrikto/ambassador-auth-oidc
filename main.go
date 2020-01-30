@@ -38,8 +38,8 @@ func parseEnvVar(envVar string) string {
 }
 
 func getenvOrDefault(key, fallback string) string {
-	value := os.Getenv(key)
-	if len(value) == 0 {
+	value, exists := os.LookupEnv(key)
+	if !exists {
 		log.Println("No ", key, " specified, using '"+fallback+"' as default.")
 		return fallback
 	}
